@@ -1,0 +1,21 @@
+# Rust / Cargo
+/target/
+Cargo.lock
+
+# Soroban build artifacts
+*.wasm
+*.wat
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env / secrets
+.env
+.env.*
+!.env.example
