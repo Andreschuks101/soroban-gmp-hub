@@ -3,14 +3,14 @@
 use super::*;
 use soroban_sdk::{
     testutils::Address as _,
-    Bytes, Env, String,
+    Bytes, BytesN, Env, String,
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn setup() -> (Env, Address, GmpHubClient<'static>) {
-    let env  = Env::default();
-    let id   = env.register_contract(None, GmpHub);
+    let env    = Env::default();
+    let id     = env.register_contract(None, GmpHub);
     let client = GmpHubClient::new(&env, &id);
     let admin  = Address::generate(&env);
 
@@ -20,13 +20,9 @@ fn setup() -> (Env, Address, GmpHubClient<'static>) {
     (env, admin, client)
 }
 
-fn str(env: &Env, s: &str) -> String {
-    String::from_str(env, s)
-}
-
-fn bytes(env: &Env, data: &[u8]) -> Bytes {
-    Bytes::from_slice(env, data)
-}
+fn chain(env: &Env, s: &str) -> String  { String::from_str(env, s) }
+fn bytes(env: &Env, d: &[u8]) -> Bytes  { Bytes::from_slice(env, d) }
+fn msg_id(env: &Env, b: u8) -> BytesN<32> { BytesN::from_array(env, &[b; 32]) }
 
 // ── Initialization ────────────────────────────────────────────────────────────
 
@@ -39,9 +35,8 @@ fn initialize_sets_admin() {
 #[test]
 fn initialize_twice_returns_error() {
     let (env, admin, client) = setup();
-    let result = client.try_initialize(&admin);
-    assert!(result.is_err());
-    let _ = env; // silence unused warning
+    let _ = env;
+    assert!(client.try_initialize(&admin).is_err());
 }
 
 #[test]
@@ -54,10 +49,54 @@ fn message_count_starts_at_zero() {
 
 #[test]
 fn transfer_admin_updates_admin() {
-    let (env, _old_admin, client) = setup();
+    let (env, _old, client) = setup();
     let new_admin = Address::generate(&env);
     client.transfer_admin(&new_admin).unwrap();
     assert_eq!(client.admin().unwrap(), new_admin);
+}
+
+// ── Adapter registry ──────────────────────────────────────────────────────────
+
+#[test]
+fn register_adapter_stores_address() {
+    let (env, _admin, client) = setup();
+    let adapter = Address::generate(&env);
+
+    client.register_adapter(&chain(&env, "ethereum"), &adapter).unwrap();
+
+    assert_eq!(
+        client.get_adapter(&chain(&env, "ethereum")),
+        Some(adapter)
+    );
+}
+
+#[test]
+fn register_adapter_twice_returns_error() {
+    let (env, _admin, client) = setup();
+    let adapter = Address::generate(&env);
+
+    client.register_adapter(&chain(&env, "ethereum"), &adapter).unwrap();
+
+    assert!(client
+        .try_register_adapter(&chain(&env, "ethereum"), &adapter)
+        .is_err());
+}
+
+#[test]
+fn remove_adapter_clears_entry() {
+    let (env, _admin, client) = setup();
+    let adapter = Address::generate(&env);
+
+    client.register_adapter(&chain(&env, "polygon"), &adapter).unwrap();
+    client.remove_adapter(&chain(&env, "polygon")).unwrap();
+
+    assert_eq!(client.get_adapter(&chain(&env, "polygon")), None);
+}
+
+#[test]
+fn get_adapter_returns_none_for_unknown_chain() {
+    let (env, _, client) = setup();
+    assert_eq!(client.get_adapter(&chain(&env, "solana")), None);
 }
 
 // ── send_message ──────────────────────────────────────────────────────────────
@@ -65,19 +104,18 @@ fn transfer_admin_updates_admin() {
 #[test]
 fn send_message_returns_msg_id_and_increments_count() {
     let (env, _admin, client) = setup();
-
     let sender = Address::generate(&env);
-    let msg_id = client
+
+    let id = client
         .send_message(
             &sender,
-            &str(&env, "ethereum"),
-            &str(&env, "0xDeadBeef"),
+            &chain(&env, "ethereum"),
+            &String::from_str(&env, "0xDeadBeef"),
             &bytes(&env, b"hello cross-chain"),
         )
         .unwrap();
 
-    // msg_id must be non-zero (ledger sequence is 1 by default in tests)
-    assert_ne!(msg_id, soroban_sdk::BytesN::from_array(&env, &[0u8; 32]));
+    assert_ne!(id, msg_id(&env, 0));
     assert_eq!(client.message_count(), 1);
 }
 
@@ -90,8 +128,8 @@ fn send_message_increments_count_each_call() {
         client
             .send_message(
                 &sender,
-                &str(&env, "polygon"),
-                &str(&env, "0xCafe"),
+                &chain(&env, "polygon"),
+                &String::from_str(&env, "0xCafe"),
                 &bytes(&env, b"msg"),
             )
             .unwrap();
@@ -102,36 +140,61 @@ fn send_message_increments_count_each_call() {
 // ── receive_message ───────────────────────────────────────────────────────────
 
 #[test]
-fn receive_message_succeeds_for_new_id() {
-    let (env, _admin, client) = setup();
+fn receive_message_succeeds_for_admin_relayer() {
+    let (env, admin, client) = setup();
 
-    let msg_id = soroban_sdk::BytesN::from_array(&env, &[1u8; 32]);
-    let result = client.receive_message(
-        &str(&env, "ethereum"),
-        &msg_id,
-        &bytes(&env, b"inbound payload"),
-    );
-    assert!(result.is_ok());
+    client
+        .receive_message(
+            &admin,
+            &chain(&env, "ethereum"),
+            &msg_id(&env, 1),
+            &bytes(&env, b"inbound payload"),
+        )
+        .unwrap();
+}
+
+#[test]
+fn receive_message_succeeds_for_registered_adapter() {
+    let (env, _admin, client) = setup();
+    let adapter = Address::generate(&env);
+
+    client.register_adapter(&chain(&env, "ethereum"), &adapter).unwrap();
+
+    client
+        .receive_message(
+            &adapter,
+            &chain(&env, "ethereum"),
+            &msg_id(&env, 2),
+            &bytes(&env, b"via adapter"),
+        )
+        .unwrap();
+}
+
+#[test]
+fn receive_message_rejects_unknown_relayer() {
+    let (env, _admin, client) = setup();
+    let stranger = Address::generate(&env);
+
+    assert!(client
+        .try_receive_message(
+            &stranger,
+            &chain(&env, "ethereum"),
+            &msg_id(&env, 3),
+            &bytes(&env, b"unauthorized"),
+        )
+        .is_err());
 }
 
 #[test]
 fn receive_message_rejects_duplicate_id() {
-    let (env, _admin, client) = setup();
+    let (env, admin, client) = setup();
+    let id = msg_id(&env, 4);
 
-    let msg_id = soroban_sdk::BytesN::from_array(&env, &[2u8; 32]);
     client
-        .receive_message(
-            &str(&env, "ethereum"),
-            &msg_id,
-            &bytes(&env, b"first delivery"),
-        )
+        .receive_message(&admin, &chain(&env, "ethereum"), &id, &bytes(&env, b"first"))
         .unwrap();
 
-    // Second call with same msg_id must fail.
-    let result = client.try_receive_message(
-        &str(&env, "ethereum"),
-        &msg_id,
-        &bytes(&env, b"duplicate"),
-    );
-    assert!(result.is_err());
+    assert!(client
+        .try_receive_message(&admin, &chain(&env, "ethereum"), &id, &bytes(&env, b"dup"))
+        .is_err());
 }

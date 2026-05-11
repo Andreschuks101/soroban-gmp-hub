@@ -67,6 +67,7 @@ The hub is **protocol-agnostic** — the adapter layer is kept separate from the
 |-----|-------------|-------|
 | `Admin` | Instance | `Address` |
 | `MessageCount` | Instance | `u64` |
+| `Adapter(chain)` | Instance | `Address` |
 | `ProcessedMsg(msg_id)` | Persistent | `bool` |
 
 ---
@@ -78,7 +79,10 @@ The hub is **protocol-agnostic** — the adapter layer is kept separate from the
 - [x] `send_message` — dispatch with event emission and monotonic counter
 - [x] `receive_message` — inbound with replay protection and event emission
 - [x] `message_count` — query total outbound messages
-- [ ] Adapter registry (next iteration)
+- [x] Adapter registry — `register_adapter` / `remove_adapter` / `get_adapter` (one adapter per chain, admin-gated)
+- [x] `receive_message` accepts registered adapter as authorized relayer
+- [ ] Multi-adapter support per chain (next iteration)
+- [ ] Adapter signature / proof verification (next iteration)
 - [ ] Token escrow / SAC integration (next iteration)
 - [ ] On-chain fee configuration (next iteration)
 - [ ] Multi-sig admin (next iteration)

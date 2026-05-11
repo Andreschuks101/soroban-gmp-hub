@@ -11,9 +11,11 @@ use soroban_sdk::{
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum Error {
-    AlreadyInitialized    = 1,
-    NotInitialized        = 2,
+    AlreadyInitialized      = 1,
+    NotInitialized          = 2,
     MessageAlreadyProcessed = 3,
+    AdapterAlreadyRegistered = 4,
+    Unauthorized            = 5,
 }
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
@@ -22,7 +24,10 @@ pub enum Error {
 pub enum DataKey {
     Admin,
     MessageCount,
-    /// Marks a (source_chain, msg_id) pair as processed to prevent replays.
+    /// Trusted relayer address for a given chain name.
+    /// e.g. DataKey::Adapter(String::from_str(&env, "ethereum"))
+    Adapter(String),
+    /// Marks a msg_id as processed to prevent replays.
     ProcessedMsg(BytesN<32>),
 }
 
@@ -45,7 +50,23 @@ pub struct MessageSentEvent {
 pub struct MessageReceivedEvent {
     pub msg_id:       BytesN<32>,
     pub source_chain: String,
+    pub relayer:      Address,
     pub payload:      Bytes,
+}
+
+/// Emitted when an adapter is registered for a chain.
+#[contracttype]
+#[derive(Clone)]
+pub struct AdapterRegisteredEvent {
+    pub chain:   String,
+    pub adapter: Address,
+}
+
+/// Emitted when an adapter is removed from a chain.
+#[contracttype]
+#[derive(Clone)]
+pub struct AdapterRemovedEvent {
+    pub chain: String,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -87,17 +108,81 @@ impl GmpHub {
         Ok(())
     }
 
+    // ── Adapter registry ──────────────────────────────────────────────────────
+
+    /// Register a trusted relayer address for a given chain.
+    ///
+    /// Only one adapter per chain is supported in this iteration.
+    /// Contributors: extend this to support multiple adapters per chain,
+    /// adapter metadata (protocol name, version), and capability flags.
+    pub fn register_adapter(
+        env: Env,
+        chain: String,
+        adapter: Address,
+    ) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+
+        if env.storage().instance().has(&DataKey::Adapter(chain.clone())) {
+            return Err(Error::AdapterAlreadyRegistered);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Adapter(chain.clone()), &adapter);
+
+        env.events().publish(
+            (symbol_short!("ADPT_REG"), chain.clone()),
+            AdapterRegisteredEvent { chain, adapter },
+        );
+
+        Ok(())
+    }
+
+    /// Remove the adapter for a given chain.
+    ///
+    /// Contributors: consider emitting a deprecation window event so
+    /// in-flight messages can still be settled before removal takes effect.
+    pub fn remove_adapter(env: Env, chain: String) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+
+        env.storage()
+            .instance()
+            .remove(&DataKey::Adapter(chain.clone()));
+
+        env.events().publish(
+            (symbol_short!("ADPT_RM"), chain.clone()),
+            AdapterRemovedEvent { chain },
+        );
+
+        Ok(())
+    }
+
+    /// Return the registered adapter address for a chain, or None.
+    pub fn get_adapter(env: Env, chain: String) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Adapter(chain))
+    }
+
     // ── Messaging ─────────────────────────────────────────────────────────────
 
     /// Dispatch a cross-chain message.
     ///
-    /// `sender` must authorize this call. A unique `msg_id` is returned that
+    /// `sender` must authorize this call. A unique `msg_id` is returned and
     /// can be used to track the message on the destination chain.
     ///
-    /// # Stub note
-    /// Production will forward `payload` (and optional token transfers) to a
-    /// registered chain-specific adapter (e.g. Axelar, LayerZero). The adapter
-    /// registry and token escrow logic will be added in a future iteration.
+    /// Contributors: route `payload` to the chain's registered adapter here,
+    /// and add optional token escrow (SAC lock) before the event is emitted.
     pub fn send_message(
         env: Env,
         sender: Address,
@@ -135,24 +220,42 @@ impl GmpHub {
 
     /// Receive and record an inbound cross-chain message.
     ///
-    /// In the foundation only the admin can call this (acting as a trusted
-    /// relayer). A future iteration will replace admin auth with a signed proof
-    /// verified against a registered adapter — preserving the same interface.
+    /// `relayer` must be either:
+    ///   a) the hub admin, or
+    ///   b) the registered adapter for `source_chain`.
     ///
     /// Reverts if `msg_id` has already been processed (replay protection).
+    ///
+    /// Contributors: replace the address-equality check with a cryptographic
+    /// proof verification step (e.g. verify a threshold signature from the
+    /// adapter's validator set before accepting the message).
     pub fn receive_message(
         env: Env,
+        relayer: Address,
         source_chain: String,
         msg_id: BytesN<32>,
         payload: Bytes,
     ) -> Result<(), Error> {
-        // Placeholder adapter auth: admin acts as the sole trusted relayer.
+        relayer.require_auth();
+
+        // Allow admin or the chain's registered adapter.
         let admin: Address = env
             .storage()
             .instance()
             .get(&DataKey::Admin)
             .ok_or(Error::NotInitialized)?;
-        admin.require_auth();
+
+        let registered: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Adapter(source_chain.clone()));
+
+        let authorized = relayer == admin
+            || registered.map(|a| a == relayer).unwrap_or(false);
+
+        if !authorized {
+            return Err(Error::Unauthorized);
+        }
 
         // Replay guard.
         if env
@@ -171,6 +274,7 @@ impl GmpHub {
             MessageReceivedEvent {
                 msg_id,
                 source_chain,
+                relayer,
                 payload,
             },
         );
@@ -189,8 +293,10 @@ impl GmpHub {
     // ── Internal helpers ──────────────────────────────────────────────────────
 
     /// Build a 32-byte message ID from the current ledger sequence and a
-    /// per-hub monotonic counter. Production will SHA-256 over all message
-    /// fields for a globally unique, collision-resistant ID.
+    /// per-hub monotonic counter.
+    ///
+    /// Contributors: replace with SHA-256 over (ledger, count, sender, chain,
+    /// destination_address, payload) for a globally collision-resistant ID.
     fn derive_msg_id(env: &Env, count: u64) -> BytesN<32> {
         let ledger = env.ledger().sequence();
         let mut raw = [0u8; 32];
